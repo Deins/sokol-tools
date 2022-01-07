@@ -1,11 +1,13 @@
 const std = @import("std");
 const bld = std.build;
+const Builder = bld.Builder;
+const Step = bld.Step;
 
 pub fn build(b: *bld.Builder) void {
-    _ = build_exe(b, b.standardTargetOptions(.{}), b.standardReleaseOptions(), "");
+    _ = buildShdcExe(b, b.standardTargetOptions(.{}), b.standardReleaseOptions(), "");
 }
 
-pub fn build_exe(b: *bld.Builder, target: std.zig.CrossTarget, mode: std.builtin.Mode, comptime prefix_path: []const u8) *bld.LibExeObjStep {
+pub fn buildShdcExe(b: *bld.Builder, target: std.zig.CrossTarget, mode: std.builtin.Mode, comptime prefix_path: []const u8) *bld.LibExeObjStep {
     const dir = prefix_path ++ "src/shdc/";
     const sources = [_][]const u8 {
         "args.cc",
@@ -52,6 +54,139 @@ pub fn build_exe(b: *bld.Builder, target: std.zig.CrossTarget, mode: std.builtin
     exe.install();
     return exe;
 }
+
+/// Utility std.build.step for compiling shader within zig buildsystem
+/// usage example (build.zig): 
+///     const sokol_tools = @import("path_to/sokol-tools/build.zig");
+///     const native_target: std.zig.CrossTarget = .{}; // even when cross compiling we want to run this now on this machine
+///     const shdc_exe = sokol_tools.buildShdcExe(builder, native_target, .ReleaseFast, "path_to/sokol-tools/");
+///     const my_shader = sokol_tools.ShdcStep.create(builder, shdc_exe, "shaders/texcube.glsl", "shaders/texcube.zig", .{});
+///     my_lib_or_exe.dependOn(&my_shader.step);
+pub const ShdcStep = struct {
+    /// args passed to sokol-shdc, build and use `zig-out/bin/sokol-shdc --help` for more info 
+    pub const Args = struct {
+        /// shdc output file format
+        format: []const u8 = "sokol_zig",
+        /// one or more shading lang
+        slangs: []const []const u8 = &.{ "glsl330", "glsl100", "glsl300es", "hlsl5", "metal_macos", "metal_ios", "wgpu" },
+        module: ?[]const u8 = null,
+        reflection: bool = true,
+        bytecode: bool = true,
+        /// any other extra args not listed here
+        extra: []const []const u8 = &.{},
+    };
+
+    args: Args = .{},
+    builder: *Builder,
+    step: Step,
+    exe: std.build.FileSource,
+    src: []const u8,
+    dest: []const u8,
+    max_stdout_size: usize = 4096,
+    check_modified: bool = true,
+    src_mtime: i128 = 0, // set in make() if check_modified is on
+
+    pub fn create(builder: *Builder, shdc_exe: *std.build.LibExeObjStep, src_file_path: []const u8, dest_file_path: []const u8, args: Args) *ShdcStep {
+        const self = builder.allocator.create(ShdcStep) catch unreachable;
+        self.* = ShdcStep{
+            .args = args,
+            .builder = builder,
+            .step = Step.init(.custom, "ShdcStep", builder.allocator, make),
+            .exe = shdc_exe.getOutputSource(),
+            .src = src_file_path,
+            .dest = dest_file_path,
+        };
+        self.step.dependOn(&shdc_exe.step);
+        return self;
+    }
+
+    fn make(step: *Step) !void {
+        const self = @fieldParentPtr(ShdcStep, "step", step);
+        if (self.check_modified) chk_mod: {
+            const f_src = std.fs.cwd().openFile(self.src, .{}) catch break :chk_mod;
+            defer f_src.close();
+            const f_dst = std.fs.cwd().openFile(self.dest, .{}) catch break :chk_mod;
+            defer f_dst.close();
+            const src_stat = f_src.stat() catch break :chk_mod;
+            const dst_stat = f_dst.stat() catch break :chk_mod;
+            self.src_mtime = src_stat.mtime; 
+            if (src_stat.mtime <= dst_stat.mtime) {
+                if (self.builder.verbose) std.debug.print("ShdcStep: skip `{s}` - not modified\n", .{self.src});
+                return;
+            }
+        }
+        if (self.builder.verbose) std.debug.print("ShdcStep: compiling `{s}` -> `{s}`\n", .{ self.src, self.dest });
+
+        // attempt to make dest directory tree in case it doesn't exist
+        self.builder.makePath(std.fs.path.dirname(self.dest).?) catch {};
+
+        var argv = std.ArrayList([]const u8).init(self.builder.allocator);
+        defer argv.deinit();
+        argv.append(self.exe.getPath(self.builder)) catch unreachable;
+        argv.append("-f") catch unreachable;
+        argv.append(self.args.format) catch unreachable;
+        argv.append("-l") catch unreachable;
+        argv.append(std.mem.join(self.builder.allocator, ":", self.args.slangs) catch unreachable) catch unreachable;
+        if (self.args.module) |m| {
+            try argv.append("-m");
+            try argv.append(m);
+        }
+        if (self.args.reflection) try argv.append("-r");
+        if (self.args.bytecode) try argv.append("-b");
+        try argv.append("-i");
+        try argv.append(self.src);
+        try argv.append("-o");
+        try argv.append(self.dest);
+        for (self.args.extra) |arg| {
+            try argv.append(arg);
+        }
+
+        const child = try std.ChildProcess.init(argv.items, self.builder.allocator);
+        defer child.deinit();
+        child.cwd = self.builder.build_root;
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        child.spawn() catch |err| {
+            std.debug.print("ShdcStep: Unable to spawn {s}: {s}\n", .{ argv.items, @errorName(err) });
+            return err;
+        };
+        var stdout: []const u8 = try child.stdout.?.reader().readAllAlloc(self.builder.allocator, self.max_stdout_size);
+        defer self.builder.allocator.free(stdout);
+        var stderr: []const u8 = try child.stderr.?.reader().readAllAlloc(self.builder.allocator, self.max_stdout_size);
+        defer self.builder.allocator.free(stderr);
+
+        const term = child.wait() catch |err| {
+            std.debug.print("Unable to spawn {s}: {s}\n", .{ argv.items[0], @errorName(err) });
+            return err;
+        };
+
+        var rc: ?u8 = null; // return code
+        if (term == .Exited) rc = term.Exited;
+        // shdc should return 0 and its stdout/err usually should be empty - print this debug otherwise
+        if (rc == null or rc.? != 0 or stdout.len > 0 or stderr.len > 0) {
+            std.debug.print(
+                \\ShdcStep command: {s}
+                \\========= stdout: ====================
+                \\{s}
+                \\========= stderr: ====================
+                \\{s}
+                \\======================================
+                \\
+            , .{ argv.items, stdout, stderr });
+        }
+        if (rc) |c| {
+            if (c != 0) {
+                std.debug.print("ShdcStep: bad exit code {}:\n", .{c});
+                return error.UnexpectedExitCode;
+            }
+        } else {
+            std.debug.print("ShdcStep: command terminated unexpectedly:\n", .{});
+            return error.UncleanExit;
+        }
+    }
+};
+
 
 fn lib_getopt(b: *bld.Builder, target: std.zig.CrossTarget,  mode: std.builtin.Mode, comptime prefix_path: []const u8) *bld.LibExeObjStep {
     const lib = b.addStaticLibrary("getopt", null);
