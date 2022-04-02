@@ -96,7 +96,7 @@ pub const ShdcStep = struct {
     src: []const u8,
     dest: []const u8,
     max_stdout_size: usize = 4096,
-    check_modified: bool = true,
+    check_modified: bool = false, // can be enabled if shaders don't depend on any other files etc.
     src_mtime: i128 = 0, // set in make() if check_modified is on
 
     pub fn create(builder: *Builder, shdc_exe: *std.build.LibExeObjStep, src_file_path: []const u8, dest_file_path: []const u8, args: Args) *ShdcStep {
